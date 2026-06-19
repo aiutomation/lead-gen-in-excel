@@ -1,0 +1,25 @@
+# Render Blueprint (infra-as-code). Create via dashboard → New → Blueprint,
+# point at this repo. Render reads this file, prompts for the sync:false secrets,
+# then builds + deploys. https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: lead-gen-in-excel
+    runtime: node
+    plan: free            # free instances spin down after ~15 min idle — kept warm by the uptime cron
+    region: singapore     # closest to Malaysia
+    buildCommand: npm ci && npm run build
+    startCommand: npm start          # `next start` binds 0.0.0.0:$PORT (Render sets PORT)
+    healthCheckPath: /api/health
+    autoDeploy: true                 # redeploy on push to the connected branch
+    envVars:
+      - key: NODE_VERSION
+        value: "20"                  # Next 16 needs Node >= 20.9
+      # Secrets — values entered in the dashboard at create time, never committed.
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: MIMO_API_KEY            # pay-as-you-go sk- key only (NOT the tp- grant token)
+        sync: false
+      - key: APP_PASSWORD
+        sync: false

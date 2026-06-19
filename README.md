@@ -1,36 +1,64 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Chilled-Water Lead Console
 
-## Getting Started
+A tiny Next.js app that replaces the manual "prompt ChatGPT → paste into Excel" loop for
+finding large buildings/facilities likely to run a **central chilled-water (HVAC)** system —
+qualified sales leads. You write a search brief, pick an LLM, get a structured table, tweak
+it inline, and export to **CSV / XLSX**.
 
-First, run the development server:
+## Quick start
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+cp .env.example .env.local   # then paste at least one API key
+npm run dev                  # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Password: **`Sales123@`** (placeholder — change `APP_PASSWORD` in `.env.local`).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Providers (set at least one key)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+A provider only appears in the dropdown if its key is present in `.env.local`.
 
-## Learn More
+| Key | Provider | Notes |
+|-----|----------|-------|
+| `GEMINI_API_KEY` | Gemini 2.5 Flash | **Web-grounded** (Google Search) — fills the *Citations* column with source URLs. The default. |
+| `GROQ_API_KEY` | Groq · Llama 3.3 70B | Fast, knowledge-only. |
+| `MIMO_API_KEY` | MiMo v2.5 | **Optional.** Pay-as-you-go `sk-` key → `api.xiaomimimo.com` (the `tp-` grant token uses a different host and forbids app backends). |
 
-To learn more about Next.js, take a look at the following resources:
+**Model picker:** for the chosen provider, the UI lists every usable model fetched live
+from that provider's `/models` endpoint (`lib/providers.ts → listModels`), so you can pick
+e.g. `gemini-2.5-pro`, `llama-3.3-70b-versatile`, or `mimo-v2.5-pro`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## How it works
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+**Fast path** (Verify off) — one research pass:
+```
+page.tsx ──POST /api/generate──▶ researchBuildings ──▶ Gemini (grounded) / Groq / MiMo ──▶ { rows }
+```
 
-## Deploy on Vercel
+**Verify path** (Verify on) — the multi-agent loop (LangGraph functional API, ported
+from `multiagent_langgraph_autogen.py`):
+```
+runResearchLoop (driver, round cap)
+  └─ entrypoint + MemorySaver  ── per round ──▶ researchTask ──▶ reviewTask
+       (verified rows persist                   (find gap)      (web fact-check:
+        across rounds via thread_id)                             keep / flag / drop)
+  stops when target met OR a round adds nothing
+```
+Dropped rows shrink the verified count, so the next round web-searches for replacements.
+Each kept row carries a `verified`/`flagged` status + reviewer note; the response includes
+a per-round `trace`.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+- `lib/agents.ts` — the LangGraph workflow + `runResearchLoop` driver (the loop).
+- `lib/llm.ts` — `callModel` primitive (grounded flag) + `researchBuildings` + `reviewBuildings`.
+- `lib/providers.ts` — provider registry; `enabledProviders()` drives the dropdown.
+- `lib/auth.ts` — password gate; checked again server-side in `/api/generate`.
+- `lib/export.ts` — SheetJS writes CSV/XLSX in the current (drag-reorderable) column order.
+- `lib/columns.ts` — the 22 default columns + default prompt.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+**Citations:** on Gemini, a grounded prose pass captures real source URLs (a JSON
+response returns none), then a structuring pass builds the rows.
+
+**Columns:** drag a chip to reorder — the table *and* the exported spreadsheet follow that order.
+
+## Stack
+Next.js (App Router) · TypeScript · Tailwind v4 · shadcn/ui · `@google/genai` · SheetJS (`xlsx`).
