@@ -36,6 +36,10 @@ yarn-error.log*
 # local agent tooling (not part of the deployable app)
 .claude/
 
+# browser-automation artifacts (snapshots, console logs, screenshots)
+.playwright-mcp/
+*.jpeg
+
 # vercel
 .vercel
 

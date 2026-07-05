@@ -1,11 +1,11 @@
 import { NextResponse } from "next/server";
 import { checkPassword } from "@/lib/auth";
 import { researchBuildings } from "@/lib/llm";
-import { runResearchLoop, type RoundLog } from "@/lib/agents";
+import { runMultiAgentResearch } from "@/lib/agents";
 import { PROVIDERS, defaultModel, resolveProviderId, type ProviderId } from "@/lib/providers";
 
 export const runtime = "nodejs";
-export const maxDuration = 300; // the verify loop runs several grounded passes
+export const maxDuration = 300; // fan-out + dedup + fact-check + enrich can run a while
 
 export async function POST(req: Request) {
   let body: {
@@ -14,11 +14,15 @@ export async function POST(req: Request) {
     model?: string;
     reviewProvider?: string;
     reviewModel?: string;
+    reviewModelId?: string; // AI-SDK "provider:model" for the review agent (unified registry)
     prompt?: string;
     columns?: string[];
     count?: number;
     verify?: boolean;
-    maxRounds?: number;
+    agents?: number; // 1..5 concurrent research agents (verify path)
+    enrich?: boolean; // run LinkedIn person-in-charge enrichment
+    modelPanel?: boolean; // each agent on a different model (Vercel AI SDK)
+    agentModels?: string[]; // explicit per-agent model ids ("provider:model")
     reviewInstructions?: string;
   };
   try {
@@ -51,25 +55,29 @@ export async function POST(req: Request) {
 
   try {
     if (body.verify) {
-      const maxRounds = Math.min(Math.max(Number(body.maxRounds) || 3, 1), 5);
-      const { rows, rounds, initial, dropped } = await runResearchLoop(
-        {
-          provider,
-          model,
-          reviewProvider,
-          reviewModel,
-          brief: body.prompt,
-          columns: body.columns,
-          target: count,
-          reviewInstructions: body.reviewInstructions,
-        },
-        maxRounds
-      );
-      // `before` = raw model output (pre-review); `rows` = verified; `dropped` = cut + reasons.
-      return NextResponse.json({ rows, before: initial, dropped, trace: rounds as RoundLog[] });
+      // Multi-agent path: N concurrent researchers → dedup agent → fact-check agent → enrich.
+      const agents = Math.min(Math.max(Number(body.agents) || 1, 1), 5);
+      const { rows, before, dropped, merges, overlap, toolLog, trace } = await runMultiAgentResearch({
+        provider,
+        model,
+        reviewProvider,
+        reviewModel,
+        reviewModelId: body.reviewModelId?.trim() || undefined,
+        brief: body.prompt,
+        columns: body.columns,
+        target: count,
+        agents,
+        enrich: !!body.enrich,
+        modelPanel: !!body.modelPanel,
+        agentModels: Array.isArray(body.agentModels) ? body.agentModels : undefined,
+        reviewInstructions: body.reviewInstructions,
+      });
+      // `before` = all raw candidates (pre-dedup); `rows` = final; `dropped` = fact-check rejects;
+      // `overlap` = per-agent provenance matrix; `toolLog` = observable web/enrichment calls.
+      return NextResponse.json({ rows, before, dropped, merges, overlap, toolLog, trace });
     }
     // Fast path — single research pass, no review loop.
-    const rows = await researchBuildings(provider, model, body.prompt, body.columns, count);
+    const { rows } = await researchBuildings(provider, model, body.prompt, body.columns, count);
     return NextResponse.json({ rows });
   } catch (e) {
     let message = e instanceof Error ? e.message : "Generation failed";

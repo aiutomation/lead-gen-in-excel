@@ -1,6 +1,7 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useState } from "react";
+import { useTheme } from "next-themes";
 import { toast } from "sonner";
 import {
   Snowflake,
@@ -17,6 +18,18 @@ import {
   GripVertical,
   CheckCircle2,
   AlertTriangle,
+  Users,
+  Layers,
+  Cpu,
+  Check,
+  Search,
+  Globe,
+  FileText,
+  UserCheck,
+  Wrench,
+  ExternalLink,
+  Sun,
+  Moon,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -38,7 +51,44 @@ import { downloadCSV, downloadXLSX } from "@/lib/export";
 import type { Row } from "@/lib/llm";
 
 type ProviderOption = { id: string; label: string; grounded: boolean; models: string[] };
-type RoundLog = { round: number; found: number; kept: number; dropped: number };
+// Per-run stats from the multi-agent pipeline (fan-out → dedup → fact-check → enrich).
+type MultiAgentTrace = {
+  agents: number;
+  rawTotal: number;
+  afterDedup: number;
+  removedDup: number;
+  kept: number;
+  dropped: number;
+  enriched: number;
+  models: string[];
+};
+type Merge = { kept: string; dropped: string[] };
+// Per-agent provenance for the overlap matrix (mirrors lib/agents.ts AgentOverlap).
+type AgentOverlapStat = {
+  index: number;
+  label: string;
+  found: number;
+  failed: boolean;
+  contributed: number;
+  uniqueVerified: number;
+};
+type OverlapBuilding = { building: string; agents: number[]; status: "verified" | "flagged" | "dropped" };
+type AgentOverlap = { agents: number; stats: AgentOverlapStat[]; buildings: OverlapBuilding[] };
+// One observable tool call (web search / scrape / enrichment), mirrors lib/search.ts ToolEvent.
+type ToolEvent = {
+  stage: "research" | "enrich";
+  agent?: number;
+  tool: "tavily" | "firecrawl" | "gemini" | "extract";
+  label: string;
+  query: string;
+  resultCount: number;
+  urls: string[];
+  ok: boolean;
+  detail?: string;
+};
+// Selectable AI-SDK model + registered-provider status (for the per-agent picker).
+type AiModelOption = { id: string; label: string; provider: string; grounded: boolean };
+type AiProviderStatus = { id: string; label: string; envKey: string; grounded: boolean; keyed: boolean };
 type DroppedRow = { row: Row; note: string };
 type ViewMode = "verified" | "raw";
 type IconType = React.ComponentType<{ className?: string }>;
@@ -139,6 +189,370 @@ function AgentPicker({
   );
 }
 
+// The Research-agent panel in Multi-model mode: one model dropdown per agent,
+// styled to match AgentPicker so the two cards read as one panel. Replaces the
+// single research provider/model picker when Multi-model is on.
+function MultiModelResearch({
+  agents,
+  aiModels,
+  aiProviders,
+  agentModels,
+  setAgentModels,
+}: {
+  agents: number;
+  aiModels: AiModelOption[];
+  aiProviders: AiProviderStatus[];
+  agentModels: string[];
+  setAgentModels: React.Dispatch<React.SetStateAction<string[]>>;
+}) {
+  const distinct = new Set(agentModels.slice(0, agents).filter(Boolean)).size;
+  return (
+    <div className="panel p-4">
+      <div className="mb-3.5 flex items-center gap-2.5">
+        <span className="grid size-8 place-items-center rounded-lg bg-primary/15 text-primary ring-1 ring-primary/25">
+          <Radar className="size-4" />
+        </span>
+        <div className="leading-tight">
+          <p className="font-mono text-xs font-semibold uppercase tracking-[0.14em]">Research agents</p>
+          <p className="label-mono mt-0.5 text-[10px] normal-case tracking-normal">
+            One model per agent · {distinct}/{agents} distinct
+          </p>
+        </div>
+        <Badge variant="outline" className="ml-auto gap-1.5 font-mono text-[10px] uppercase">
+          <Cpu className="size-3 text-primary" />
+          multi-model
+        </Badge>
+      </div>
+
+      {aiModels.length === 0 ? (
+        <p className="font-mono text-xs text-muted-foreground">Loading models…</p>
+      ) : (
+        <div className="grid gap-2.5 sm:grid-cols-2">
+          {Array.from({ length: agents }, (_, i) => (
+            <div key={i} className="space-y-1.5">
+              <FieldLabel>Agent {i + 1}</FieldLabel>
+              <Select
+                value={agentModels[i] ?? ""}
+                onValueChange={(v) =>
+                  setAgentModels((prev) => {
+                    const next = [...prev];
+                    next[i] = v ?? "";
+                    return next;
+                  })
+                }
+              >
+                <SelectTrigger className="w-full font-mono text-xs">
+                  <SelectValue>
+                    {aiModels.find((m) => m.id === agentModels[i])?.label ?? "Select model"}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {aiModels.map((m) => (
+                    <SelectItem key={m.id} value={m.id} className="font-mono text-xs">
+                      {m.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* What another key would unlock — drives the "add apikey afterwards" flow. */}
+      {aiProviders.some((p) => !p.keyed) && (
+        <p className="mt-3 font-mono text-[10px] leading-relaxed text-muted-foreground/70">
+          Add a key to unlock:{" "}
+          {aiProviders
+            .filter((p) => !p.keyed)
+            .map((p) => `${p.label} (${p.envKey})`)
+            .join(" · ")}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// Per-agent color from the theme's chart ramp. Built as an inline CSS var (not a
+// `chart-${i}` class) so Tailwind's JIT can't purge a runtime-built class name.
+const agentColor = (i: number) => `var(--chart-${(i % 5) + 1})`;
+
+// The overlap matrix: a per-agent summary strip + a building × agent grid. Answers
+// "which agents pull their weight" (solo-verified) and "does overlap/dedup really
+// happen and on what scheme" (copies column + folded aliases), from REAL run data.
+function AgentOverlapMatrix({ overlap }: { overlap: AgentOverlap }) {
+  const { stats, buildings } = overlap;
+  return (
+    <div className="border-t border-border p-5">
+      <div className="mb-3 flex items-center gap-2">
+        <Radar className="size-3.5 text-primary" />
+        <FieldLabel>Agent overlap · {buildings.length} buildings</FieldLabel>
+      </div>
+
+      {/* Per-agent summary strip — solo-verified is each agent's real marginal value. */}
+      <div className="mb-4 flex flex-wrap gap-2">
+        {stats.map((s) => (
+          <div
+            key={s.index}
+            className="flex items-center gap-2 rounded-lg border border-border bg-secondary/40 px-3 py-1.5 font-mono text-[11px]"
+          >
+            <span className="size-2 rounded-full" style={{ backgroundColor: agentColor(s.index) }} />
+            <span className="text-muted-foreground">A{s.index + 1}</span>
+            <span className="max-w-[130px] truncate" title={s.label}>
+              {s.label}
+            </span>
+            {s.failed ? (
+              <span className="rounded bg-destructive/15 px-1.5 py-0.5 text-destructive">failed</span>
+            ) : (
+              <>
+                <span className="text-muted-foreground">· {s.found} found</span>
+                <span className="font-semibold text-primary">· {s.uniqueVerified} solo-verified</span>
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* Building × agent grid — ✓ = agent found it (incl. folded aliases); Copies = overlap. */}
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse text-sm">
+          <thead>
+            <tr className="border-b border-border bg-secondary/40">
+              <th className="sticky left-0 z-10 bg-secondary/40 px-3 py-2.5 text-left font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+                Building
+              </th>
+              {stats.map((s) => (
+                <th
+                  key={s.index}
+                  className="px-3 py-2.5 text-center font-mono text-[10px] uppercase tracking-wider"
+                  style={{ color: agentColor(s.index) }}
+                  title={s.label}
+                >
+                  A{s.index + 1}
+                </th>
+              ))}
+              <th className="px-3 py-2.5 text-center font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+                Copies
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {buildings.map((b, r) => {
+              const dropped = b.status === "dropped";
+              return (
+                <tr
+                  key={r}
+                  className={`border-b border-border/60 transition-colors hover:bg-primary/5 ${
+                    dropped ? "opacity-60" : ""
+                  }`}
+                >
+                  <td
+                    className={`sticky left-0 z-10 bg-card px-3 py-1.5 font-mono text-xs ${
+                      dropped ? "text-muted-foreground line-through" : ""
+                    }`}
+                  >
+                    <span className="flex items-center gap-1.5">
+                      {b.status === "verified" && (
+                        <CheckCircle2 className="size-3.5 shrink-0 text-primary" aria-label="verified" />
+                      )}
+                      {b.status === "flagged" && (
+                        <AlertTriangle className="size-3.5 shrink-0 text-warn" aria-label="flagged" />
+                      )}
+                      {dropped && <X className="size-3.5 shrink-0 text-destructive" aria-label="dropped" />}
+                      {b.building}
+                    </span>
+                  </td>
+                  {stats.map((s) => {
+                    const hit = b.agents.includes(s.index);
+                    return (
+                      <td key={s.index} className="px-3 py-1.5 text-center">
+                        {hit ? (
+                          <Check
+                            className="mx-auto size-3.5"
+                            style={{ color: agentColor(s.index) }}
+                            aria-label="found"
+                          />
+                        ) : (
+                          <span className="text-muted-foreground/30">·</span>
+                        )}
+                      </td>
+                    );
+                  })}
+                  <td className="px-3 py-1.5 text-center font-mono text-xs tabular-nums text-muted-foreground">
+                    {b.agents.length}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="mt-3 font-mono text-[10px] leading-relaxed text-muted-foreground/70">
+        Copies = how many agents independently found this building. Solo-verified = buildings only that
+        agent found that survived fact-check — an agent&apos;s real marginal value.
+      </p>
+    </div>
+  );
+}
+
+// A single-select model picker over the RICH AI-SDK registry (all keyed providers),
+// used for the review agent so it can pick from the same models as research — not
+// just the 3 legacy providers.
+function AiModelPicker({
+  title,
+  hint,
+  Icon,
+  aiModels,
+  value,
+  onChange,
+}: {
+  title: string;
+  hint: string;
+  Icon: IconType;
+  aiModels: AiModelOption[];
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const active = aiModels.find((m) => m.id === value);
+  return (
+    <div className="panel p-4">
+      <div className="mb-3.5 flex items-center gap-2.5">
+        <span className="grid size-8 place-items-center rounded-lg bg-primary/15 text-primary ring-1 ring-primary/25">
+          <Icon className="size-4" />
+        </span>
+        <div className="leading-tight">
+          <p className="font-mono text-xs font-semibold uppercase tracking-[0.14em]">{title}</p>
+          <p className="label-mono mt-0.5 text-[10px] normal-case tracking-normal">{hint}</p>
+        </div>
+        {active && (
+          <Badge variant="outline" className="ml-auto gap-1.5 font-mono text-[10px] uppercase">
+            <span className={`size-1.5 rounded-full ${active.grounded ? "bg-primary" : "bg-muted-foreground"}`} />
+            {active.grounded ? "grounded" : "knowledge"}
+          </Badge>
+        )}
+      </div>
+      <div className="space-y-1.5">
+        <FieldLabel>Model{aiModels.length ? ` · ${aiModels.length}` : ""}</FieldLabel>
+        <Select value={value} onValueChange={(v) => onChange(v ?? "")} disabled={!aiModels.length}>
+          <SelectTrigger className="w-full font-mono">
+            <SelectValue>{active?.label ?? "Select model"}</SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            {aiModels.map((m) => (
+              <SelectItem key={m.id} value={m.id} className="font-mono text-xs">
+                {m.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+    </div>
+  );
+}
+
+// Icon + human label per tool kind, for the activity log.
+const TOOL_META: Record<ToolEvent["tool"], { Icon: IconType; label: string }> = {
+  tavily: { Icon: Search, label: "Web search (Tavily)" },
+  firecrawl: { Icon: FileText, label: "Page scrape (Firecrawl)" },
+  gemini: { Icon: Globe, label: "Google-Search grounding" },
+  extract: { Icon: UserCheck, label: "Person-in-charge extraction" },
+};
+
+const shortHost = (u: string) => {
+  try {
+    return new URL(u).hostname.replace(/^www\./, "");
+  } catch {
+    return u.slice(0, 40);
+  }
+};
+
+// Renders the run's tool calls so the user can SEE that web search / LinkedIn lookup /
+// enrichment actually ran — with the query, hit count, evidence URLs, and outcome.
+function ToolActivity({ toolLog }: { toolLog: ToolEvent[] }) {
+  const research = toolLog.filter((e) => e.stage === "research");
+  const enrich = toolLog.filter((e) => e.stage === "enrich");
+
+  const EventRow = (e: ToolEvent, i: number) => {
+    const meta = TOOL_META[e.tool];
+    return (
+      <li key={i} className="flex flex-col gap-1 border-b border-border/50 py-2 last:border-0">
+        <div className="flex items-center gap-2 font-mono text-[11px]">
+          <meta.Icon className={`size-3.5 shrink-0 ${e.ok ? "text-primary" : "text-muted-foreground/50"}`} />
+          <span className="text-foreground">{meta.label}</span>
+          {typeof e.agent === "number" && (
+            <span className="rounded bg-secondary px-1.5 text-[10px] text-muted-foreground">A{e.agent + 1}</span>
+          )}
+          <span className="truncate text-muted-foreground">{e.label}</span>
+          <span className={`ml-auto shrink-0 ${e.ok ? "text-primary" : "text-warn"}`}>
+            {e.resultCount} {e.resultCount === 1 ? "result" : "results"}
+          </span>
+        </div>
+        <div className="pl-6 font-mono text-[10px] leading-relaxed text-muted-foreground/70">
+          <span className="text-muted-foreground/50">query:</span> {e.query}
+        </div>
+        {e.detail && <div className="pl-6 font-mono text-[10px] text-primary/80">{e.detail}</div>}
+        {e.urls.length > 0 && (
+          <div className="flex flex-wrap gap-x-3 gap-y-0.5 pl-6">
+            {e.urls.map((u, j) => (
+              <a
+                key={j}
+                href={u}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 font-mono text-[10px] text-primary/80 hover:text-primary hover:underline"
+              >
+                <ExternalLink className="size-2.5" />
+                {shortHost(u)}
+              </a>
+            ))}
+          </div>
+        )}
+      </li>
+    );
+  };
+
+  return (
+    <div className="border-t border-border p-5">
+      <div className="mb-3 flex items-center gap-2">
+        <Wrench className="size-3.5 text-primary" />
+        <FieldLabel>Tool activity · {toolLog.length} calls</FieldLabel>
+      </div>
+      {research.length > 0 && (
+        <>
+          <p className="label-mono mb-1 text-[10px]">Research · web search per agent</p>
+          <ul className="mb-4">{research.map(EventRow)}</ul>
+        </>
+      )}
+      {enrich.length > 0 && (
+        <>
+          <p className="label-mono mb-1 text-[10px]">Enrichment · LinkedIn / person-in-charge</p>
+          <ul>{enrich.map(EventRow)}</ul>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Light/dark switch. Renders a stable placeholder until mounted so the button
+// doesn't flash the wrong icon during hydration (theme is unknown server-side).
+function ThemeToggle() {
+  const { resolvedTheme, setTheme } = useTheme();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const isDark = resolvedTheme === "dark";
+  return (
+    <button
+      type="button"
+      aria-label="Toggle theme"
+      onClick={() => setTheme(isDark ? "light" : "dark")}
+      className="grid size-8 cursor-pointer place-items-center rounded-lg border border-border bg-secondary/40 text-muted-foreground transition-colors hover:text-primary"
+    >
+      {!mounted ? <Sun className="size-4" /> : isDark ? <Sun className="size-4" /> : <Moon className="size-4" />}
+    </button>
+  );
+}
+
 export default function Home() {
   const [unlocked, setUnlocked] = useState(false);
   const [pwInput, setPwInput] = useState("");
@@ -156,13 +570,23 @@ export default function Home() {
 
   const [count, setCount] = useState(15);
   const [verify, setVerify] = useState(true);
+  const [agents, setAgents] = useState(3); // concurrent research agents (1..5)
+  const [enrich, setEnrich] = useState(false); // LinkedIn person-in-charge lookup (opt-in; pricey)
+  const [modelPanel, setModelPanel] = useState(true); // ON by default → 3 distinct models (goal)
+  const [aiModels, setAiModels] = useState<AiModelOption[]>([]); // selectable models (keyed providers)
+  const [aiProviders, setAiProviders] = useState<AiProviderStatus[]>([]); // registry status (for hints)
+  const [agentModels, setAgentModels] = useState<string[]>([]); // per-agent model id, index = agent
   const [reviewInstructions, setReviewInstructions] = useState("");
 
   const [rows, setRows] = useState<Row[]>([]); // verified ("after")
-  const [before, setBefore] = useState<Row[] | null>(null); // raw model output, pre-review
+  const [before, setBefore] = useState<Row[] | null>(null); // raw candidates, pre-dedup
   const [dropped, setDropped] = useState<DroppedRow[]>([]); // rows the reviewer cut + reasons
+  const [merges, setMerges] = useState<Merge[]>([]); // duplicate buildings the dedup agent folded
   const [view, setView] = useState<ViewMode>("verified");
-  const [trace, setTrace] = useState<RoundLog[] | null>(null);
+  const [trace, setTrace] = useState<MultiAgentTrace | null>(null);
+  const [overlap, setOverlap] = useState<AgentOverlap | null>(null); // per-agent provenance matrix
+  const [reviewModelId, setReviewModelId] = useState(""); // AI-SDK model id for the review agent
+  const [toolLog, setToolLog] = useState<ToolEvent[]>([]); // observable tool calls from the run
   const [loading, setLoading] = useState(false);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
 
@@ -192,6 +616,57 @@ export default function Home() {
   useEffect(() => {
     if (unlocked) loadProviders();
   }, [unlocked, loadProviders]);
+
+  // Load the selectable AI-SDK models for the per-agent picker (Multi-model mode).
+  const loadAiModels = useCallback(async () => {
+    try {
+      const res = await fetch("/api/models");
+      const data = (await res.json()) as { models: AiModelOption[]; providers: AiProviderStatus[] };
+      setAiModels(data.models ?? []);
+      setAiProviders(data.providers ?? []);
+    } catch {
+      toast.error("Could not load AI-SDK models");
+    }
+  }, []);
+
+  // Load the rich AI-SDK model list on unlock (not just in Multi-model mode) — the
+  // review agent picker uses it too now, so it must be available even when the
+  // research fan-out isn't in panel mode.
+  useEffect(() => {
+    if (unlocked) loadAiModels();
+  }, [unlocked, loadAiModels]);
+
+  // Default the review agent to a sensible AI-SDK model once the list loads
+  // (prefer gemini-2.5-flash), preserving any manual pick that's still valid.
+  useEffect(() => {
+    if (!aiModels.length) return;
+    setReviewModelId((cur) => {
+      if (cur && aiModels.some((m) => m.id === cur)) return cur;
+      return aiModels.find((m) => m.id === "gemini:gemini-2.5-flash")?.id ?? aiModels[0].id;
+    });
+  }, [aiModels]);
+
+  // Keep agentModels sized to `agents`, defaulting to DISTINCT models by sequence.
+  // The goal default is "one Gemini, one Groq-Llama, one GPT" — using models that
+  // actually run (gpt-oss via Groq, not the gateway gpt-4o which needs a paid key).
+  // Then fill any extra agents with the remaining distinct models. Preserves user picks.
+  useEffect(() => {
+    if (!aiModels.length) return;
+    const ids = aiModels.map((m) => m.id);
+    const preferred = [
+      "gemini:gemini-2.5-flash",
+      "groq:llama-3.3-70b-versatile",
+      "groq:openai/gpt-oss-120b", // a working GPT on the (free) Groq key
+    ].filter((id) => ids.includes(id));
+    const seq = [...preferred, ...ids.filter((id) => !preferred.includes(id))]; // preferred first
+    setAgentModels((prev) =>
+      Array.from({ length: agents }, (_, i) => {
+        const cur = prev[i];
+        if (cur && ids.includes(cur)) return cur; // keep a still-valid manual pick
+        return seq[i % seq.length]; // distinct default, by sequence
+      })
+    );
+  }, [aiModels, agents]);
 
   // Keep each agent's model valid for its selected provider: when a provider
   // changes (or the lists load), snap that agent's model to the first option.
@@ -255,10 +730,15 @@ export default function Home() {
           model,
           reviewProvider,
           reviewModel,
+          reviewModelId, // AI-SDK model for the review agent (unified registry)
           prompt,
           columns,
           count,
           verify,
+          agents,
+          enrich,
+          modelPanel,
+          agentModels: modelPanel ? agentModels.slice(0, agents) : undefined,
           reviewInstructions,
         }),
       });
@@ -266,13 +746,19 @@ export default function Home() {
         rows?: Row[];
         before?: Row[];
         dropped?: DroppedRow[];
-        trace?: RoundLog[];
+        merges?: Merge[];
+        overlap?: AgentOverlap;
+        toolLog?: ToolEvent[];
+        trace?: MultiAgentTrace;
         error?: string;
       };
       if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
       setRows(data.rows ?? []);
       setBefore(data.before ?? null);
       setDropped(data.dropped ?? []);
+      setMerges(data.merges ?? []);
+      setOverlap(data.overlap ?? null);
+      setToolLog(data.toolLog ?? []);
       setTrace(data.trace ?? null);
       setView("verified");
       toast.success(`Generated ${data.rows?.length ?? 0} buildings`);
@@ -368,6 +854,7 @@ export default function Home() {
             <Badge variant="secondary" className="font-mono text-[10px]">
               {rows.length} rows
             </Badge>
+            <ThemeToggle />
           </div>
         </div>
       </header>
@@ -376,7 +863,7 @@ export default function Home() {
         {/* 01 — QUERY + AGENTS */}
         <section className="panel animate-in fade-in slide-in-from-bottom-2 p-5 duration-500">
           <div className="mb-3 flex items-center gap-2">
-            <span className="kicker">01</span>
+            <span className="section-kicker">01</span>
             <FieldLabel>Search brief</FieldLabel>
           </div>
           <Textarea
@@ -404,30 +891,48 @@ export default function Home() {
             </div>
           )}
 
-          {/* Two agents, one layout — research finds, review fact-checks. */}
-          <div className="mt-5 grid gap-3 md:grid-cols-2">
-            <AgentPicker
-              title="Research agent"
-              hint="Finds candidate buildings"
-              Icon={Radar}
-              providers={providers}
-              provider={provider}
-              onProvider={setProvider}
-              model={model}
-              onModel={setModel}
-            />
-            <AgentPicker
-              title="Review agent"
-              hint={verify ? "Fact-checks each candidate" : "Enable Verify to use"}
-              Icon={ShieldCheck}
-              providers={providers}
-              provider={reviewProvider}
-              onProvider={setReviewProvider}
-              model={reviewModel}
-              onModel={setReviewModel}
-              disabled={!verify}
-            />
-          </div>
+          {/* Research + review. In Multi-model mode the research card BECOMES the
+              per-agent model panel (one card, not a separate section below). */}
+          {verify && modelPanel ? (
+            <div className="mt-5 space-y-3">
+              <MultiModelResearch
+                agents={agents}
+                aiModels={aiModels}
+                aiProviders={aiProviders}
+                agentModels={agentModels}
+                setAgentModels={setAgentModels}
+              />
+              <AiModelPicker
+                title="Review agent"
+                hint="Dedups + fact-checks · any model"
+                Icon={ShieldCheck}
+                aiModels={aiModels}
+                value={reviewModelId}
+                onChange={setReviewModelId}
+              />
+            </div>
+          ) : (
+            <div className="mt-5 grid gap-3 md:grid-cols-2">
+              <AgentPicker
+                title="Research agent"
+                hint="Finds candidate buildings"
+                Icon={Radar}
+                providers={providers}
+                provider={provider}
+                onProvider={setProvider}
+                model={model}
+                onModel={setModel}
+              />
+              <AiModelPicker
+                title="Review agent"
+                hint={verify ? "Fact-checks each candidate · any model" : "Enable Verify to use"}
+                Icon={ShieldCheck}
+                aiModels={aiModels}
+                value={reviewModelId}
+                onChange={setReviewModelId}
+              />
+            </div>
+          )}
 
           {providers.length === 0 && (
             <p className="mt-3 font-mono text-xs text-destructive">
@@ -449,7 +954,22 @@ export default function Home() {
               />
             </div>
 
-            {/* Verify toggle — turns on the researcher→reviewer→regenerate loop */}
+            {/* Agents — how many researchers fan out concurrently (verify path). */}
+            {verify && (
+              <div className="w-24 space-y-1.5">
+                <FieldLabel>Agents</FieldLabel>
+                <Input
+                  type="number"
+                  min={1}
+                  max={5}
+                  value={agents}
+                  onChange={(e) => setAgents(Math.min(Math.max(Number(e.target.value) || 1, 1), 5))}
+                  className="font-mono"
+                />
+              </div>
+            )}
+
+            {/* Verify toggle — turns on the multi-agent fan-out → dedup → fact-check pipeline */}
             <label className="flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-border bg-secondary/40 px-3">
               <ShieldCheck
                 className={`size-4 ${verify ? "text-primary" : "text-muted-foreground"}`}
@@ -457,6 +977,24 @@ export default function Home() {
               <span className="label-mono text-[11px]">Verify</span>
               <Switch checked={verify} onCheckedChange={setVerify} />
             </label>
+
+            {/* Multi-model toggle — each agent runs a different model (Vercel AI SDK). */}
+            {verify && (
+              <label className="flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-border bg-secondary/40 px-3">
+                <Cpu className={`size-4 ${modelPanel ? "text-primary" : "text-muted-foreground"}`} />
+                <span className="label-mono text-[11px]">Multi-model</span>
+                <Switch checked={modelPanel} onCheckedChange={setModelPanel} />
+              </label>
+            )}
+
+            {/* Enrich toggle — LinkedIn person-in-charge lookup on the kept rows. */}
+            {verify && (
+              <label className="flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-border bg-secondary/40 px-3">
+                <Users className={`size-4 ${enrich ? "text-primary" : "text-muted-foreground"}`} />
+                <span className="label-mono text-[11px]">Enrich</span>
+                <Switch checked={enrich} onCheckedChange={setEnrich} />
+              </label>
+            )}
 
             <Button
               onClick={generate}
@@ -471,12 +1009,13 @@ export default function Home() {
               {loading ? (verify ? "Verifying" : "Generating") : "Generate"}
             </Button>
           </div>
+
         </section>
 
         {/* 02 — COLUMNS */}
         <section className="panel animate-in fade-in slide-in-from-bottom-2 p-5 delay-100 duration-500">
           <div className="mb-3 flex items-center gap-2">
-            <span className="kicker">02</span>
+            <span className="section-kicker">02</span>
             <FieldLabel>Columns · {columns.length}</FieldLabel>
             <span className="font-mono text-[10px] text-muted-foreground/70">drag to reorder</span>
           </div>
@@ -530,13 +1069,30 @@ export default function Home() {
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border p-5">
             <div className="flex items-center gap-3">
               <div className="flex items-center gap-2">
-                <span className="kicker">03</span>
+                <span className="section-kicker">03</span>
                 <FieldLabel>Results</FieldLabel>
               </div>
-              {before && before.length > 0 && (
+              {trace ? (
                 <Badge variant="outline" className="gap-1.5 font-mono text-[10px]">
-                  <ShieldCheck className="size-3 text-primary" />
-                  {before.length} raw → {rows.length} verified · {dropped.length} dropped
+                  <Layers className="size-3 text-primary" />
+                  {trace.agents}× agents · {trace.rawTotal} raw → {trace.afterDedup} unique → {trace.kept} verified
+                  {trace.dropped > 0 && ` · ${trace.dropped} dropped`}
+                  {trace.enriched > 0 && ` · ${trace.enriched} PIC`}
+                </Badge>
+              ) : (
+                before &&
+                before.length > 0 && (
+                  <Badge variant="outline" className="gap-1.5 font-mono text-[10px]">
+                    <ShieldCheck className="size-3 text-primary" />
+                    {before.length} raw → {rows.length} verified · {dropped.length} dropped
+                  </Badge>
+                )
+              )}
+              {/* Which models the fan-out ran on — only when the panel used >1. */}
+              {trace && trace.models.length > 1 && (
+                <Badge variant="outline" className="gap-1.5 font-mono text-[10px]">
+                  <Cpu className="size-3 text-primary" />
+                  {trace.models.join(" · ")}
                 </Badge>
               )}
             </div>
@@ -679,6 +1235,32 @@ export default function Home() {
                   </tbody>
                 </table>
               </div>
+
+              {/* Agent overlap matrix — who found what, how much they overlapped, real value. */}
+              {view === "verified" && overlap && overlap.agents > 1 && overlap.buildings.length > 0 && (
+                <AgentOverlapMatrix overlap={overlap} />
+              )}
+
+              {/* Tool activity — proves web search / LinkedIn lookup / enrichment ran. */}
+              {view === "verified" && toolLog.length > 0 && <ToolActivity toolLog={toolLog} />}
+
+              {/* Duplicates the dedup agent folded together (alias/typo matches). */}
+              {view === "verified" && merges.length > 0 && (
+                <div className="border-t border-border p-5">
+                  <div className="mb-2.5 flex items-center gap-2">
+                    <Layers className="size-3.5 text-primary" />
+                    <FieldLabel>Duplicates merged · {merges.length}</FieldLabel>
+                  </div>
+                  <ul className="space-y-1.5">
+                    {merges.map((m, i) => (
+                      <li key={i} className="flex flex-wrap items-baseline gap-x-2 font-mono text-xs">
+                        <span className="text-primary">{m.kept}</span>
+                        <span className="text-muted-foreground">← {m.dropped.join(", ")}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
               {/* Dropped rows + reasons — the review agent's value, made visible. */}
               {view === "verified" && dropped.length > 0 && (

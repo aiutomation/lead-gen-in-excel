@@ -23,6 +23,9 @@ export const DEFAULT_COLUMNS: string[] = [
   "Energy Consumption (kWh)",
   "Chiller Type",
   "Data Availability Notes",
+  // Filled by the LinkedIn enrichment step (Enrich toggle) — left "N/A" otherwise.
+  "Person In Charge",
+  "PIC LinkedIn",
   "Citations",
 ];
 

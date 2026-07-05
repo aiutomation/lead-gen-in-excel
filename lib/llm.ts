@@ -1,7 +1,14 @@
 import { GoogleGenAI } from "@google/genai";
 import { PROVIDERS, type ProviderId } from "./providers";
+import { tavilySearch, hitsToContext, hasTavily, type ToolEvent } from "./search";
 
 export type Row = Record<string, string>;
+
+// An injected LLM text-completer. Lets the review/dedup/enrich functions run on a
+// DIFFERENT backend (the Vercel AI-SDK model registry) without importing it — the
+// orchestrator passes a closure. When omitted, they fall back to the legacy callModel
+// path (Gemini/Groq/MiMo). Dependency injection = no llm.ts → ai-models.ts cycle.
+export type LlmRun = (system: string, user: string, grounded?: boolean) => Promise<string>;
 
 // One reviewer verdict per candidate building.
 export type Verdict = {
@@ -29,13 +36,17 @@ export async function callModel(
   model: string,
   system: string,
   user: string,
-  grounded = true
+  grounded = true,
+  // `temperature` lets the fan-out give each of the N research agents a different
+  // sampling temperature, so "same brief" still yields DIFFERENT candidates worth
+  // deduping (rather than five near-identical lists).
+  temperature?: number
 ): Promise<{ text: string; sources: string[] }> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) await sleep(800 * attempt); // 0ms, 800ms, 1600ms backoff
     try {
-      return await callModelOnce(provider, model, system, user, grounded);
+      return await callModelOnce(provider, model, system, user, grounded, temperature);
     } catch (e) {
       lastErr = e;
       if (!isTransient(e)) throw e; // only retry transient failures
@@ -49,7 +60,8 @@ async function callModelOnce(
   model: string,
   system: string,
   user: string,
-  grounded: boolean
+  grounded: boolean,
+  temperature?: number
 ): Promise<{ text: string; sources: string[] }> {
   const cfg = PROVIDERS[provider];
   if (!process.env[cfg.env]) {
@@ -63,7 +75,10 @@ async function callModelOnce(
       contents: `${system}\n\n${user}`,
       // Only attach the Google-Search tool when grounding is wanted. Note: a JSON
       // response suppresses source chunks, so grounded prose is used to fetch URLs.
-      config: grounded ? { tools: [{ googleSearch: {} }] } : {},
+      config: {
+        ...(grounded ? { tools: [{ googleSearch: {} }] } : {}),
+        ...(temperature !== undefined ? { temperature } : {}),
+      },
     });
     const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
     const sources = chunks
@@ -86,7 +101,7 @@ async function callModelOnce(
         { role: "user", content: user },
       ],
       response_format: { type: "json_object" },
-      temperature: 0.3,
+      temperature: temperature ?? 0.3,
     }),
   });
   if (!res.ok) {
@@ -101,7 +116,7 @@ async function callModelOnce(
 // ---------------------------------------------------------------- JSON parsing
 // Models sometimes wrap JSON in ```fences``` or add stray prose. Pull the
 // first array/object out robustly.
-function parseJsonLoose(text: string): unknown {
+export function parseJsonLoose(text: string): unknown {
   const cleaned = text.replace(/```json/gi, "").replace(/```/g, "").trim();
   try {
     return JSON.parse(cleaned);
@@ -117,7 +132,7 @@ function parseJsonLoose(text: string): unknown {
   }
 }
 
-function asArray(data: unknown): unknown[] {
+export function asArray(data: unknown): unknown[] {
   if (Array.isArray(data)) return data;
   const obj = data as Record<string, unknown>;
   return (obj?.rows as unknown[]) ?? (obj?.buildings as unknown[]) ?? (obj?.verdicts as unknown[]) ?? [];
@@ -143,11 +158,35 @@ export async function researchBuildings(
   brief: string,
   columns: string[],
   count: number,
-  exclude: string[] = []
-): Promise<Row[]> {
+  exclude: string[] = [],
+  // Fan-out knobs: `temperature` varies sampling per agent, `diversify` is a one-line
+  // nudge so each of the N agents explores a different slant of the same brief.
+  opts: { temperature?: number; diversify?: string } = {}
+): Promise<{ rows: Row[]; events: ToolEvent[] }> {
+  const { temperature, diversify } = opts;
+  const events: ToolEvent[] = [];
   const excludeLine = exclude.length
     ? `Do NOT include any of these already-found buildings: ${JSON.stringify(exclude)}.`
     : "";
+  const diversifyLine = diversify ? `Angle for THIS agent: ${diversify}` : "";
+
+  // Give NON-grounded providers (Groq/MiMo) live web access via Tavily, so "every
+  // agent has web search" — not just Gemini. Gemini keeps its native Google-Search
+  // grounding below, so we skip the extra Tavily call for it.
+  let webContext = "";
+  if (!PROVIDERS[provider].grounded && hasTavily()) {
+    const hits = await tavilySearch(brief, { maxResults: 6 });
+    if (hits.length) {
+      webContext =
+        "Live web results (use these as grounding — prefer buildings that appear here):\n" +
+        hitsToContext(hits);
+    }
+    events.push({
+      stage: "research", tool: "tavily", label: `Web search · ${PROVIDERS[provider].label}`,
+      query: brief.slice(0, 120), resultCount: hits.length,
+      urls: hits.map((h) => h.url).filter(Boolean).slice(0, 5), ok: hits.length > 0,
+    });
+  }
 
   // When the user wants Citations from Gemini, do a grounded PROSE pass first to
   // capture real source URLs (a JSON response would return none), then structure
@@ -162,13 +201,15 @@ export async function researchBuildings(
         "Use web search to find REAL, named buildings — never invent placeholders.",
       [
         `Task: ${brief}`,
+        diversifyLine,
         excludeLine,
         `Find up to ${count} buildings. For EACH, write a short paragraph with its name, address, ` +
           "type, storeys, and anything about its air-conditioning / chiller system. Cite as you go.",
       ]
         .filter(Boolean)
         .join("\n"),
-      true // grounded prose -> real source URLs in `sources`
+      true, // grounded prose -> real source URLs in `sources`
+      temperature
     );
 
     const structured = await callModel(
@@ -190,17 +231,24 @@ export async function researchBuildings(
     const rows = asArray(parseJsonLoose(structured.text)).map((o) => normalizeRow(o, columns));
     const joined = research.sources.length ? research.sources.join(" | ") : "N/A";
     for (const r of rows) r.Citations = joined; // batch-level real source URLs
-    return rows;
+    events.push({
+      stage: "research", tool: "gemini", label: `Google-Search grounding · ${model}`,
+      query: brief.slice(0, 120), resultCount: research.sources.length,
+      urls: research.sources.slice(0, 5), ok: research.sources.length > 0,
+    });
+    return { rows, events };
   }
 
   // Lean single-call path (no Citations wanted, or non-Gemini provider).
-  const { text } = await callModel(
+  const { text, sources } = await callModel(
     provider,
     model,
     "You are a building/facility prospecting researcher for a chilled-water (HVAC) sales team. " +
       "Find REAL, named buildings — never invent placeholders.",
     [
       `Task: ${brief}`,
+      diversifyLine,
+      webContext,
       "",
       `Return up to ${count} buildings as a JSON array of objects.`,
       "Each object MUST have EXACTLY these keys (verbatim spelling):",
@@ -213,9 +261,20 @@ export async function researchBuildings(
       '- Output JSON ONLY in the form {"rows": [ ... ]}. No prose, no markdown fences.',
     ]
       .filter(Boolean)
-      .join("\n")
+      .join("\n"),
+    true,
+    temperature
   );
-  return asArray(parseJsonLoose(text)).map((o) => normalizeRow(o, columns));
+  // Gemini's native grounding returns source URLs even without the Citations pass —
+  // record them so the UI shows this agent used web grounding.
+  if (PROVIDERS[provider].grounded && sources.length) {
+    events.push({
+      stage: "research", tool: "gemini", label: `Google-Search grounding · ${model}`,
+      query: brief.slice(0, 120), resultCount: sources.length, urls: sources.slice(0, 5), ok: true,
+    });
+  }
+  const rows = asArray(parseJsonLoose(text)).map((o) => normalizeRow(o, columns));
+  return { rows, events };
 }
 
 // ---------------------------------------------------------------- REVIEWER
@@ -226,7 +285,8 @@ export async function reviewBuildings(
   brief: string,
   rows: Row[],
   columns: string[],
-  instructions = "" // optional user-authored rules that steer the reviewer
+  instructions = "", // optional user-authored rules that steer the reviewer
+  run?: LlmRun // AI-SDK completer (unified registry); falls back to legacy callModel
 ): Promise<Verdict[]> {
   const system =
     "You are a fact-checking reviewer for a sales-prospecting table. " +
@@ -257,7 +317,7 @@ export async function reviewBuildings(
     .filter(Boolean)
     .join("\n");
 
-  const { text } = await callModel(provider, model, system, user);
+  const text = run ? await run(system, user, true) : (await callModel(provider, model, system, user)).text;
   return asArray(parseJsonLoose(text))
     .map((v) => v as Record<string, unknown>)
     .filter((v) => typeof v.index === "number")
@@ -271,4 +331,115 @@ export async function reviewBuildings(
           ? (v.corrections as Record<string, string>)
           : undefined,
     }));
+}
+
+// ---------------------------------------------------------------- DEDUP AGENT
+// Review agent #1 — when N research agents run the SAME brief, the same building
+// shows up under different names ("KLCC" / "Suria KLCC" / "Petronas Twin Towers").
+// An exact-string key can't catch those aliases, so an LLM decides the *grouping*
+// (the fuzzy, semantic part) and code does the *merge* (the mechanical part).
+
+export type DedupResult = {
+  rows: Row[]; // one row per unique building, with N/A cells back-filled from its dupes
+  removed: number; // how many duplicate rows were folded away
+  merges: { kept: string; dropped: string[] }[]; // for the UI trace — what merged into what
+};
+
+// How "complete" a row is = how many cells carry a real value (not N/A / empty).
+// Used to pick the best row in a duplicate group as the one to keep.
+const completeness = (r: Row, columns: string[]) =>
+  columns.reduce((n, c) => n + (r[c] && r[c] !== "N/A" ? 1 : 0), 0);
+
+const nameOf = (r: Row, columns: string[]) => r["Building"] ?? r[columns[0]] ?? "—";
+
+export async function dedupeBuildings(
+  provider: ProviderId,
+  model: string,
+  rows: Row[],
+  columns: string[],
+  run?: LlmRun // AI-SDK completer (unified registry); falls back to legacy callModel
+): Promise<DedupResult> {
+  // Nothing to compare → no-op (cheap guard; also avoids a pointless LLM call).
+  if (rows.length < 2) return { rows, removed: 0, merges: [] };
+
+  const compact = rows.map((r, i) => ({
+    index: i,
+    Building: nameOf(r, columns),
+    Address: r["Address"] ?? "",
+  }));
+  const system =
+    "You group duplicate building listings. Two entries are the SAME building if they " +
+    "are the same physical structure — even when names differ (abbreviation, alias, " +
+    "brand vs legal name, language) or one address is partial. Different towers of the " +
+    "same complex are SEPARATE buildings.";
+  const user = [
+    "Partition EVERY index below into groups; each group is one real-world building.",
+    "A unique building is a group of one. Duplicates share a group.",
+    JSON.stringify(compact),
+    "",
+    'Output JSON ONLY: {"groups": [[0,3],[1],[2,4]]} covering every index exactly once.',
+  ].join("\n");
+
+  let groups: number[][];
+  try {
+    const text = run ? await run(system, user, false) : (await callModel(provider, model, system, user)).text;
+    const parsed = parseJsonLoose(text) as { groups?: unknown };
+    const raw = Array.isArray(parsed) ? parsed : (parsed?.groups ?? []);
+    groups = (raw as unknown[])
+      .filter(Array.isArray)
+      .map((g) =>
+        (g as unknown[]).filter(
+          (n): n is number => typeof n === "number" && Number.isInteger(n) && n >= 0 && n < rows.length
+        )
+      );
+  } catch {
+    // If the dedup agent fails, don't drop data — treat every row as unique.
+    return { rows, removed: 0, merges: [] };
+  }
+
+  return applyDedupGroups(rows, groups, columns);
+}
+
+// Pure merge step (no LLM, no I/O) — given the agent's grouping, normalise coverage
+// and fold each group into one row. Exported so it can be unit-tested directly.
+export function applyDedupGroups(rows: Row[], groups: number[][], columns: string[]): DedupResult {
+  // Defensive: ensure every index appears exactly once. Indices the model forgot
+  // become their own singleton group; duplicates-within-output are ignored.
+  const assigned = new Set<number>();
+  const clean: number[][] = [];
+  for (const g of groups) {
+    const fresh = g.filter((i) => i >= 0 && i < rows.length && !assigned.has(i));
+    if (fresh.length) {
+      fresh.forEach((i) => assigned.add(i));
+      clean.push(fresh);
+    }
+  }
+  rows.forEach((_, i) => {
+    if (!assigned.has(i)) clean.push([i]); // forgotten index → its own building
+  });
+
+  // Merge each group: keep the most-complete row, back-fill its N/A cells from mates.
+  const merges: { kept: string; dropped: string[] }[] = [];
+  const out: Row[] = clean.map((group) => {
+    const members = group.map((i) => rows[i]);
+    const canonical = members.reduce((best, r) =>
+      completeness(r, columns) > completeness(best, columns) ? r : best
+    );
+    const merged: Row = { ...canonical };
+    for (const col of columns) {
+      if (!merged[col] || merged[col] === "N/A") {
+        const fill = members.find((m) => m[col] && m[col] !== "N/A");
+        if (fill) merged[col] = fill[col];
+      }
+    }
+    if (group.length > 1) {
+      merges.push({
+        kept: nameOf(canonical, columns),
+        dropped: members.filter((m) => m !== canonical).map((m) => nameOf(m, columns)),
+      });
+    }
+    return merged;
+  });
+
+  return { rows: out, removed: rows.length - out.length, merges };
 }

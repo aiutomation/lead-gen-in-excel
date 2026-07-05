@@ -50,41 +50,45 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+/* LIGHT theme — the same chilled-water identity as dark, inverted onto a cool
+   near-white "blueprint paper": ice-white surfaces, a deeper cyan signal (dark
+   enough to read on white), slate text, amber for attention. Same hue family
+   (240→214) so light and dark feel like one product. */
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
+  --background: oklch(0.985 0.006 220); /* cool paper white */
+  --foreground: oklch(0.26 0.03 240); /* deep slate ink */
+  --card: oklch(1 0 0); /* pure white cards lift off the paper */
+  --card-foreground: oklch(0.24 0.03 240);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.24 0.03 240);
+  --primary: oklch(0.58 0.13 224); /* deeper cyan — readable on white */
+  --primary-foreground: oklch(0.99 0.01 220);
+  --secondary: oklch(0.955 0.012 224);
+  --secondary-foreground: oklch(0.3 0.03 240);
+  --muted: oklch(0.955 0.012 224);
+  --muted-foreground: oklch(0.5 0.028 234);
+  --accent: oklch(0.93 0.03 214);
+  --accent-foreground: oklch(0.3 0.05 224);
   --destructive: oklch(0.577 0.245 27.325);
-  --warn: oklch(0.72 0.16 65);
-  --warn-foreground: oklch(0.2 0.03 240);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
-  --chart-1: oklch(0.87 0 0);
-  --chart-2: oklch(0.556 0 0);
-  --chart-3: oklch(0.439 0 0);
-  --chart-4: oklch(0.371 0 0);
-  --chart-5: oklch(0.269 0 0);
+  --warn: oklch(0.62 0.15 62); /* amber, darkened for white bg contrast */
+  --warn-foreground: oklch(0.99 0.01 220);
+  --border: oklch(0.88 0.02 224); /* visible hairline on white */
+  --input: oklch(0.9 0.018 224);
+  --ring: oklch(0.58 0.13 224 / 45%);
+  --chart-1: oklch(0.55 0.13 224);
+  --chart-2: oklch(0.58 0.12 195);
+  --chart-3: oklch(0.5 0.12 255);
+  --chart-4: oklch(0.58 0.13 165);
+  --chart-5: oklch(0.62 0.13 75);
   --radius: 0.625rem;
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+  --sidebar: oklch(0.97 0.008 224);
+  --sidebar-foreground: oklch(0.26 0.03 240);
+  --sidebar-primary: oklch(0.55 0.13 224);
+  --sidebar-primary-foreground: oklch(0.99 0.01 220);
+  --sidebar-accent: oklch(0.93 0.03 214);
+  --sidebar-accent-foreground: oklch(0.3 0.05 224);
+  --sidebar-border: oklch(0.88 0.02 224);
+  --sidebar-ring: oklch(0.58 0.13 224 / 45%);
 }
 
 /* Chilled-water engineering console — deep OLED slate shell, ice-cyan signal,
@@ -131,14 +135,22 @@
   }
   body {
     @apply bg-background text-foreground;
-    /* Blueprint grid + a cool overhead glow, so the panel reads like an instrument. */
+    background-attachment: fixed;
+    /* LIGHT default — faint ice-blue blueprint grid on cool paper (softer than dark). */
+    background-image:
+      radial-gradient(900px 520px at 85% -10%, oklch(0.58 0.13 224 / 0.07), transparent 60%),
+      radial-gradient(700px 500px at 0% 0%, oklch(0.58 0.12 195 / 0.05), transparent 55%),
+      linear-gradient(to right, oklch(0.55 0.08 224 / 0.05) 1px, transparent 1px),
+      linear-gradient(to bottom, oklch(0.55 0.08 224 / 0.05) 1px, transparent 1px);
+    background-size: 100% 100%, 100% 100%, 28px 28px, 28px 28px;
+  }
+  /* DARK — deep OLED slate shell with the brighter cyan blueprint glow. */
+  .dark body {
     background-image:
       radial-gradient(900px 500px at 85% -10%, oklch(0.79 0.135 214 / 0.1), transparent 60%),
       radial-gradient(700px 500px at 0% 0%, oklch(0.7 0.12 195 / 0.06), transparent 55%),
       linear-gradient(to right, oklch(0.78 0.06 214 / 0.05) 1px, transparent 1px),
       linear-gradient(to bottom, oklch(0.78 0.06 214 / 0.05) 1px, transparent 1px);
-    background-size: 100% 100%, 100% 100%, 28px 28px, 28px 28px;
-    background-attachment: fixed;
   }
   html {
     @apply font-sans;
@@ -154,8 +166,19 @@
   .kicker {
     @apply font-mono text-xs font-medium text-primary tabular-nums;
   }
-  /* One panel surface — same radius, border, blur on every card. */
+  /* Boxed section marker — makes each numbered section (01/02/03) read as a clearly
+     separated unit at a glance, in both themes. */
+  .section-kicker {
+    @apply grid size-6 shrink-0 place-items-center rounded-md bg-primary/12 font-mono text-[11px] font-semibold tabular-nums text-primary ring-1 ring-primary/25;
+  }
+  /* One panel surface — same radius + border everywhere. A soft shadow lifts each
+     card off the background so sections separate cleanly (especially on light). */
   .panel {
-    @apply rounded-xl border border-border bg-card/60 backdrop-blur-sm;
+    @apply rounded-xl border border-border bg-card/80 shadow-sm backdrop-blur-sm;
+  }
+  .dark .panel {
+    /* On the dark shell the border + glow already separate cards; keep the card
+       translucent and drop the light-mode drop-shadow. */
+    @apply bg-card/60 shadow-none;
   }
 }
