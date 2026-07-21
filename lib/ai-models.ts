@@ -41,7 +41,9 @@ const PROVIDERS: AiProvider[] = [
     envKey: "GEMINI_API_KEY",
     kind: "google",
     grounded: true,
-    models: ["gemini-2.5-flash", "gemini-2.5-pro"],
+    // `*-latest` aliases: gemini-2.5-flash 404s for new accounts; flash-lite-latest
+    // has usable free-tier quota. Aliases won't silently expire by name.
+    models: ["gemini-flash-lite-latest", "gemini-flash-latest"],
     modelsUrl: "https://generativelanguage.googleapis.com/v1beta/openai/models",
   },
   {

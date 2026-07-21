@@ -16,7 +16,7 @@ afterEach(() => {
 
 describe("defaultModel", () => {
   it("returns the first curated model for each provider", () => {
-    expect(defaultModel("gemini")).toBe("gemini-2.5-flash");
+    expect(defaultModel("gemini")).toBe("gemini-flash-lite-latest");
     expect(defaultModel("groq")).toBe("llama-3.3-70b-versatile");
     expect(defaultModel("mimo")).toBe("mimo-v2.5-pro");
   });
@@ -70,10 +70,10 @@ describe("listModels", () => {
         json: async () => ({
           data: [
             { id: "models/text-embedding-004" }, // dropped — embedding
-            { id: "models/gemini-2.0-flash" }, // curated → preferred (kept in curated order)
+            { id: "models/gemini-flash-latest" }, // curated → preferred (2nd in curated order)
             { id: "models/imagen-3.0" }, // dropped — image model
             { id: "models/gemini-9.9-ultra" }, // extra gemini → appended, sorted
-            { id: "models/gemini-2.5-flash" }, // curated → preferred (first)
+            { id: "models/gemini-flash-lite-latest" }, // curated → preferred (first)
             { id: "models/aqa" }, // dropped — aqa
           ],
         }),
@@ -83,8 +83,8 @@ describe("listModels", () => {
     const models = await listModels("gemini");
 
     // Curated-present models come first, in curated order (reliable UI default).
-    expect(models[0]).toBe("gemini-2.5-flash");
-    expect(models[1]).toBe("gemini-2.0-flash");
+    expect(models[0]).toBe("gemini-flash-lite-latest");
+    expect(models[1]).toBe("gemini-flash-latest");
     // Extra live model is retained (prefix stripped).
     expect(models).toContain("gemini-9.9-ultra");
     // Non-text models are filtered out.

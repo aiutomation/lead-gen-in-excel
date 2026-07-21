@@ -85,7 +85,7 @@ export async function POST(req: Request) {
     const m = message.match(/"message"\s*:\s*"([^"]+)"/);
     if (m) message = m[1];
     if (/quota|limit:\s*0/i.test(message)) {
-      message = `${model}: free-tier quota exceeded for this model — pick another model (e.g. gemini-2.5-flash).`;
+      message = `${model}: free-tier quota exceeded for this model — pick another model (e.g. gemini-flash-lite-latest).`;
     }
     return NextResponse.json({ error: message }, { status: 500 });
   }

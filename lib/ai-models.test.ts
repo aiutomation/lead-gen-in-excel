@@ -28,7 +28,7 @@ describe("buildModelPool", () => {
   it("includes only providers whose key is configured", () => {
     vi.stubEnv("GEMINI_API_KEY", "k");
     const pool = buildModelPool();
-    expect(pool.map((m) => m.id)).toEqual(["gemini:gemini-2.5-flash"]);
+    expect(pool.map((m) => m.id)).toEqual(["gemini:gemini-flash-lite-latest"]);
     expect(pool[0].grounded).toBe(true);
   });
 
@@ -37,7 +37,7 @@ describe("buildModelPool", () => {
     vi.stubEnv("GROQ_API_KEY", "k");
     vi.stubEnv("MIMO_API_KEY", "k");
     expect(buildModelPool().map((m) => m.id)).toEqual([
-      "gemini:gemini-2.5-flash",
+      "gemini:gemini-flash-lite-latest",
       "groq:llama-3.3-70b-versatile",
       "mimo:mimo-v2.5-pro",
     ]);
@@ -49,7 +49,7 @@ describe("buildModelPool", () => {
     vi.stubEnv("XAI_API_KEY", "k");
     vi.stubEnv("DEEPSEEK_API_KEY", "k");
     expect(buildModelPool().map((m) => m.id)).toEqual([
-      "gemini:gemini-2.5-flash",
+      "gemini:gemini-flash-lite-latest",
       "openai:gpt-4o-mini",
       "xai:grok-2-latest",
       "deepseek:deepseek-chat",
@@ -67,9 +67,9 @@ describe("pickModelForAgent", () => {
     vi.stubEnv("GROQ_API_KEY", "k");
     vi.stubEnv("MIMO_API_KEY", "k");
     const pool = buildModelPool(); // length 3
-    expect(pickModelForAgent(pool, 0).id).toBe("gemini:gemini-2.5-flash");
+    expect(pickModelForAgent(pool, 0).id).toBe("gemini:gemini-flash-lite-latest");
     expect(pickModelForAgent(pool, 2).id).toBe("mimo:mimo-v2.5-pro");
-    expect(pickModelForAgent(pool, 3).id).toBe("gemini:gemini-2.5-flash"); // wraps
+    expect(pickModelForAgent(pool, 3).id).toBe("gemini:gemini-flash-lite-latest"); // wraps
     expect(pickModelForAgent(pool, 4).id).toBe("groq:llama-3.3-70b-versatile");
   });
 });

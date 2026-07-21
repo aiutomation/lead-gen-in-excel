@@ -637,12 +637,12 @@ export default function Home() {
   }, [unlocked, loadAiModels]);
 
   // Default the review agent to a sensible AI-SDK model once the list loads
-  // (prefer gemini-2.5-flash), preserving any manual pick that's still valid.
+  // (prefer gemini-flash-lite-latest), preserving any manual pick that's still valid.
   useEffect(() => {
     if (!aiModels.length) return;
     setReviewModelId((cur) => {
       if (cur && aiModels.some((m) => m.id === cur)) return cur;
-      return aiModels.find((m) => m.id === "gemini:gemini-2.5-flash")?.id ?? aiModels[0].id;
+      return aiModels.find((m) => m.id === "gemini:gemini-flash-lite-latest")?.id ?? aiModels[0].id;
     });
   }, [aiModels]);
 
@@ -654,7 +654,7 @@ export default function Home() {
     if (!aiModels.length) return;
     const ids = aiModels.map((m) => m.id);
     const preferred = [
-      "gemini:gemini-2.5-flash",
+      "gemini:gemini-flash-lite-latest",
       "groq:llama-3.3-70b-versatile",
       "groq:openai/gpt-oss-120b", // a working GPT on the (free) Groq key
     ].filter((id) => ids.includes(id));

@@ -121,13 +121,29 @@ export function parseJsonLoose(text: string): unknown {
   try {
     return JSON.parse(cleaned);
   } catch {
-    // fall back to the widest [ ... ] or { ... } span
+    // Fall back to the widest [ ... ] or { ... } span. That slice can ALSO be
+    // invalid — e.g. a model that echoed the prompt template `{"index": <n>, ...}` —
+    // so guard each attempt. A raw SyntaxError must NEVER escape this function;
+    // callers rely on the friendly Error below to degrade instead of 500-ing.
+    const tryParse = (s: string): unknown | undefined => {
+      try {
+        return JSON.parse(s);
+      } catch {
+        return undefined; // JSON.parse never legitimately returns undefined
+      }
+    };
     const a = cleaned.indexOf("[");
     const b = cleaned.lastIndexOf("]");
-    if (a !== -1 && b > a) return JSON.parse(cleaned.slice(a, b + 1));
+    if (a !== -1 && b > a) {
+      const r = tryParse(cleaned.slice(a, b + 1));
+      if (r !== undefined) return r;
+    }
     const c = cleaned.indexOf("{");
     const d = cleaned.lastIndexOf("}");
-    if (c !== -1 && d > c) return JSON.parse(cleaned.slice(c, d + 1));
+    if (c !== -1 && d > c) {
+      const r = tryParse(cleaned.slice(c, d + 1));
+      if (r !== undefined) return r;
+    }
     throw new Error("Model did not return parseable JSON");
   }
 }
@@ -318,7 +334,16 @@ export async function reviewBuildings(
     .join("\n");
 
   const text = run ? await run(system, user, true) : (await callModel(provider, model, system, user)).text;
-  return asArray(parseJsonLoose(text))
+  // A reviewer that returns unparseable JSON (e.g. echoes the `{"index": <n>, ...}`
+  // template above) must NOT crash the request. Like dedupeBuildings, degrade to
+  // "no verdicts" — nothing gets rejected, so every candidate row passes through.
+  let parsed: unknown[];
+  try {
+    parsed = asArray(parseJsonLoose(text));
+  } catch {
+    return [];
+  }
+  return parsed
     .map((v) => v as Record<string, unknown>)
     .filter((v) => typeof v.index === "number")
     .map((v) => ({

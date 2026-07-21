@@ -18,7 +18,9 @@ export const PROVIDERS: Record<ProviderId, ProviderConfig> = {
     label: "Gemini",
     env: "GEMINI_API_KEY",
     grounded: true,
-    models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
+    // `*-latest` aliases so a model name can't silently expire (gemini-2.5-flash
+    // now 404s for new accounts). flash-lite-latest has usable free-tier quota.
+    models: ["gemini-flash-lite-latest", "gemini-flash-latest"],
     // OpenAI-compatible model list (generation still uses the @google/genai SDK).
     modelsUrl: "https://generativelanguage.googleapis.com/v1beta/openai/models",
   },
