@@ -85,7 +85,7 @@ export async function POST(req: Request) {
     const m = message.match(/"message"\s*:\s*"([^"]+)"/);
     if (m) message = m[1];
     if (/quota|limit:\s*0/i.test(message)) {
-      message = `${model}: free-tier quota exceeded for this model — pick another model (e.g. gemini-flash-lite-latest).`;
+      message = `${model}: free-tier quota exceeded — switch provider (Groq's llama-3.3-70b-versatile is free and works) or add billing to this key.`;
     }
     return NextResponse.json({ error: message }, { status: 500 });
   }
