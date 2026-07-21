@@ -171,6 +171,13 @@
   .section-kicker {
     @apply grid size-6 shrink-0 place-items-center rounded-md bg-primary/12 font-mono text-[11px] font-semibold tabular-nums text-primary ring-1 ring-primary/25;
   }
+
+  /* Enhanced section header with visual distinction — light mode uses subtle bg tint,
+     dark mode uses border glow. */
+  .section-header {
+    @apply flex items-center gap-3 mb-4 pb-3 border-b border-border/60;
+  }
+
   /* One panel surface — same radius + border everywhere. A soft shadow lifts each
      card off the background so sections separate cleanly (especially on light). */
   .panel {
@@ -180,5 +187,21 @@
     /* On the dark shell the border + glow already separate cards; keep the card
        translucent and drop the light-mode drop-shadow. */
     @apply bg-card/60 shadow-none;
+  }
+
+  /* Light mode: subtle background color on panels for better distinction. */
+  .panel {
+    @apply bg-card/50;
+  }
+  .dark .panel {
+    @apply bg-card/60;
+  }
+
+  /* Subsection panels within Results — visual hierarchy inside the main panel. */
+  .subsection {
+    @apply rounded-lg border border-border/40 bg-background/50 p-4;
+  }
+  .dark .subsection {
+    @apply border-border/25 bg-card/20;
   }
 }
