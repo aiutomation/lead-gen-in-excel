@@ -46,6 +46,7 @@ import {
 } from "@/components/ui/select";
 
 import { DEFAULT_COLUMNS, DEFAULT_PROMPT } from "@/lib/columns";
+import { usePersistentState } from "@/lib/use-persistent-state";
 import { checkPassword } from "@/lib/auth";
 import { downloadCSV, downloadXLSX } from "@/lib/export";
 import type { Row } from "@/lib/llm";
@@ -91,6 +92,37 @@ type AiModelOption = { id: string; label: string; provider: string; grounded: bo
 type AiProviderStatus = { id: string; label: string; envKey: string; grounded: boolean; keyed: boolean };
 type DroppedRow = { row: Row; note: string };
 type ViewMode = "verified" | "raw";
+
+// Renders a row's Citations (string[] of source URLs) as a compact stacked list of
+// clickable links. Shows the hostname as the label to keep the cell narrow.
+function CitationsCell({ urls }: { urls?: string[] }) {
+  if (!urls || urls.length === 0)
+    return <span className="block min-w-32 px-2 py-1 text-xs text-muted-foreground">N/A</span>;
+  const host = (u: string) => {
+    try {
+      return new URL(u).hostname.replace(/^www\./, "");
+    } catch {
+      return u;
+    }
+  };
+  return (
+    <ul className="min-w-32 space-y-0.5 px-2 py-1">
+      {urls.map((u, i) => (
+        <li key={i}>
+          <a
+            href={u}
+            target="_blank"
+            rel="noreferrer"
+            title={u}
+            className="block truncate text-xs text-primary underline-offset-2 hover:underline"
+          >
+            {host(u)}
+          </a>
+        </li>
+      ))}
+    </ul>
+  );
+}
 type IconType = React.ComponentType<{ className?: string }>;
 
 const PW_KEY = "lg_pw"; // sessionStorage key for the unlock password
@@ -557,8 +589,8 @@ export default function Home() {
   const [unlocked, setUnlocked] = useState(false);
   const [pwInput, setPwInput] = useState("");
 
-  const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
-  const [columns, setColumns] = useState<string[]>(DEFAULT_COLUMNS);
+  const [prompt, setPrompt] = usePersistentState("lg_prompt", DEFAULT_PROMPT);
+  const [columns, setColumns] = usePersistentState<string[]>("lg_columns", DEFAULT_COLUMNS);
   const [providers, setProviders] = useState<ProviderOption[]>([]);
 
   // Research agent (finds candidates) and review agent (fact-checks) each pick
@@ -568,15 +600,15 @@ export default function Home() {
   const [reviewProvider, setReviewProvider] = useState("");
   const [reviewModel, setReviewModel] = useState("");
 
-  const [count, setCount] = useState(15);
-  const [verify, setVerify] = useState(true);
-  const [agents, setAgents] = useState(3); // concurrent research agents (1..5)
-  const [enrich, setEnrich] = useState(false); // LinkedIn person-in-charge lookup (opt-in; pricey)
-  const [modelPanel, setModelPanel] = useState(true); // ON by default → 3 distinct models (goal)
+  const [count, setCount] = usePersistentState("lg_count", 15);
+  const [verify, setVerify] = usePersistentState("lg_verify", true);
+  const [agents, setAgents] = usePersistentState("lg_agents", 3); // concurrent research agents (1..5)
+  const [enrich, setEnrich] = usePersistentState("lg_enrich", false); // LinkedIn person-in-charge lookup (opt-in; pricey)
+  const [modelPanel, setModelPanel] = usePersistentState("lg_model_panel", true); // ON by default → 3 distinct models (goal)
   const [aiModels, setAiModels] = useState<AiModelOption[]>([]); // selectable models (keyed providers)
   const [aiProviders, setAiProviders] = useState<AiProviderStatus[]>([]); // registry status (for hints)
-  const [agentModels, setAgentModels] = useState<string[]>([]); // per-agent model id, index = agent
-  const [reviewInstructions, setReviewInstructions] = useState("");
+  const [agentModels, setAgentModels] = usePersistentState<string[]>("lg_agent_models", []); // per-agent model id, index = agent
+  const [reviewInstructions, setReviewInstructions] = usePersistentState("lg_review_instructions", "");
 
   const [rows, setRows] = useState<Row[]>([]); // verified ("after")
   const [before, setBefore] = useState<Row[] | null>(null); // raw candidates, pre-dedup
@@ -585,7 +617,7 @@ export default function Home() {
   const [view, setView] = useState<ViewMode>("verified");
   const [trace, setTrace] = useState<MultiAgentTrace | null>(null);
   const [overlap, setOverlap] = useState<AgentOverlap | null>(null); // per-agent provenance matrix
-  const [reviewModelId, setReviewModelId] = useState(""); // AI-SDK model id for the review agent
+  const [reviewModelId, setReviewModelId] = usePersistentState("lg_review_model", ""); // AI-SDK model id for the review agent
   const [toolLog, setToolLog] = useState<ToolEvent[]>([]); // observable tool calls from the run
   const [loading, setLoading] = useState(false);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
@@ -709,6 +741,24 @@ export default function Home() {
       next.splice(to, 0, moved);
       return next;
     });
+
+  // Wipe persisted settings back to defaults. Setting each state back to its
+  // default lets the usePersistentState write-effects rewrite localStorage;
+  // clearing agentModels/reviewModelId lets the async default effects repopulate
+  // the distinct-model defaults once /api/models has loaded.
+  const resetSettings = () => {
+    setPrompt(DEFAULT_PROMPT);
+    setColumns(DEFAULT_COLUMNS);
+    setCount(15);
+    setVerify(true);
+    setAgents(3);
+    setEnrich(false);
+    setModelPanel(true);
+    setAgentModels([]);
+    setReviewInstructions("");
+    setReviewModelId("");
+    toast.success("Settings reset to defaults");
+  };
 
   // --- cell editing (lets the user "compile nicely" before export) ---
   const updateCell = (rowIndex: number, col: string, value: string) =>
@@ -1018,6 +1068,14 @@ export default function Home() {
             <span className="section-kicker">02</span>
             <FieldLabel>Columns · {columns.length}</FieldLabel>
             <span className="font-mono text-[10px] text-muted-foreground/70">drag to reorder</span>
+            {/* Settings persist in localStorage across sessions — this is the escape hatch. */}
+            <button
+              onClick={resetSettings}
+              className="ml-auto cursor-pointer font-mono text-[10px] uppercase tracking-wider text-muted-foreground/70 transition-colors hover:text-foreground"
+              title="Clear saved columns, models, and prompts — restore defaults"
+            >
+              Reset to defaults
+            </button>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             {columns.map((col, i) => (
@@ -1200,7 +1258,11 @@ export default function Home() {
                             </td>
                             {columns.map((col, c) => (
                               <td key={c} className="px-1 py-1 align-top">
-                                {verifiedView ? (
+                                {col === "Citations" ? (
+                                  // Citations is a per-row string[] of source URLs — render as a
+                                  // stacked list of clickable links, not an editable text cell.
+                                  <CitationsCell urls={row.Citations} />
+                                ) : verifiedView ? (
                                   <input
                                     value={row[col] ?? ""}
                                     onChange={(e) => updateCell(r, col, e.target.value)}

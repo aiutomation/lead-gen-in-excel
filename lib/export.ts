@@ -5,7 +5,11 @@ import type { Row } from "./llm"; // type-only: keeps the Gemini SDK out of the 
 function toSheet(rows: Row[], columns: string[]) {
   const ordered = rows.map((r) => {
     const o: Record<string, string> = {};
-    for (const c of columns) o[c] = r[c] ?? "";
+    for (const c of columns) {
+      const v = r[c];
+      // Citations is a string[] — one URL per line so the cell stays readable.
+      o[c] = Array.isArray(v) ? v.join("\n") : (v ?? "");
+    }
     return o;
   });
   return XLSX.utils.json_to_sheet(ordered, { header: columns });

@@ -1,8 +1,25 @@
 import { GoogleGenAI } from "@google/genai";
 import { PROVIDERS, type ProviderId } from "./providers";
 import { tavilySearch, hitsToContext, hasTavily, type ToolEvent } from "./search";
+import { FEW_SHOT_EXAMPLES } from "./columns";
 
-export type Row = Record<string, string>;
+// Every cell is a string EXCEPT `Citations`, which is a per-row array of the real
+// source URLs that grounded the row. `__status`/`__note` are review metadata.
+export type Row = Record<string, string> & {
+  Citations?: string[];
+  __status?: string;
+  __note?: string;
+};
+
+// A row rejected by the grounding gate / reviewer, with the reason. (Structurally
+// identical to agents.ts DroppedRow — kept local so llm.ts has no cycle back to it.)
+type GroundedDrop = { row: Row; note: string };
+
+// The single identity/name column for a lead. The new schema's first column is the
+// internal "File No." (a number), so prefer the human name "Job Site" — falling back
+// to the legacy "Building" key and then columns[0] for older/custom column sets.
+export const nameOf = (r: Row, columns: string[]): string =>
+  r["Job Site"] ?? r["Building"] ?? r[columns[0]] ?? "—";
 
 // An injected LLM text-completer. Lets the review/dedup/enrich functions run on a
 // DIFFERENT backend (the Vercel AI-SDK model registry) without importing it — the
@@ -155,14 +172,58 @@ export function asArray(data: unknown): unknown[] {
 }
 
 // Force every cell to a string keyed by the requested columns; missing -> "N/A".
-function normalizeRow(obj: unknown, columns: string[]): Row {
+// `Citations` is the exception: it's an array of source URLs, defaulted to [] and
+// filled by the grounding step — never string-coerced here.
+export function normalizeRow(obj: unknown, columns: string[]): Row {
   const rec = obj && typeof obj === "object" ? (obj as Record<string, unknown>) : {};
   const row: Row = {};
   for (const col of columns) {
+    if (col === "Citations") continue; // handled as string[] by applyGrounding
     const v = rec[col];
     row[col] = v === undefined || v === null || v === "" ? "N/A" : String(v);
   }
+  // Only carry a Citations array when it's actually a requested column, so the row
+  // contract stays "exactly the requested columns" for schemas that don't want it.
+  if (columns.includes("Citations")) row.Citations = [];
   return row;
+}
+
+// Pull the model's per-row citation URLs (structuring pass emits "Citations": [...]).
+export function rawCitations(obj: unknown): string[] {
+  const rec = (obj ?? {}) as Record<string, unknown>;
+  return Array.isArray(rec.Citations) ? rec.Citations.map(String).filter(Boolean) : [];
+}
+// Pull the columns the model admitted it could not tie to a source ("_ungrounded").
+export function rawUngrounded(obj: unknown): string[] {
+  const rec = (obj ?? {}) as Record<string, unknown>;
+  return Array.isArray(rec._ungrounded) ? rec._ungrounded.map(String) : [];
+}
+
+// ---------------------------------------------------------------- GROUNDING GATE
+// The execution-phase rule: every extracted value must trace to a source URL that
+// the grounded search ACTUALLY returned, or it's rejected. Pure (no I/O) so it's
+// unit-testable.
+//   - Blank the columns the model flagged `_ungrounded` to "N/A".
+//   - Keep only citation URLs present in `validUrls` (drops any URL the model invented).
+//   - A row left with zero citations has no grounded fact → dropped.
+export function applyGrounding(
+  items: { row: Row; ungrounded: string[] }[],
+  validUrls: string[],
+  columns: string[]
+): { kept: Row[]; dropped: GroundedDrop[] } {
+  const valid = new Set(validUrls);
+  const kept: Row[] = [];
+  const dropped: GroundedDrop[] = [];
+  for (const { row, ungrounded } of items) {
+    for (const col of ungrounded) {
+      if (col !== "Citations" && columns.includes(col)) row[col] = "N/A";
+    }
+    const cites = (Array.isArray(row.Citations) ? row.Citations : []).filter((u) => valid.has(u));
+    row.Citations = cites;
+    if (cites.length === 0) dropped.push({ row, note: "No source URL returned — rejected." });
+    else kept.push(row);
+  }
+  return { kept, dropped };
 }
 
 // ---------------------------------------------------------------- RESEARCHER
@@ -220,7 +281,9 @@ export async function researchBuildings(
         diversifyLine,
         excludeLine,
         `Find up to ${count} buildings. For EACH, write a short paragraph with its name, address, ` +
-          "type, storeys, and anything about its air-conditioning / chiller system. Cite as you go.",
+          "type, storeys, and anything about its air-conditioning / chiller system. " +
+          "Put the source URL in parentheses right after each fact you state — do not write any " +
+          "fact you cannot cite.",
       ]
         .filter(Boolean)
         .join("\n"),
@@ -236,23 +299,35 @@ export async function researchBuildings(
         "Research notes:",
         research.text,
         "",
+        "Match this format (values only — omit fields the notes don't cover):",
+        JSON.stringify(FEW_SHOT_EXAMPLES[0]),
+        "",
         `Convert into up to ${count} objects in a JSON array. Each object MUST have EXACTLY these keys:`,
         JSON.stringify(columns),
         '- Every value is a string. Use "N/A" when the notes do not say.',
+        '- "Citations": an array of the source URLs from the notes that support THIS building.',
+        '- "_ungrounded": an array listing any of the above columns whose value has NO supporting',
+        "  source in the notes (so it can be rejected). Leave [] if every value is cited.",
         '- Output JSON ONLY in the form {"rows": [ ... ]}.',
       ].join("\n"),
       false // structuring only — no search needed, and keeps it fast
     );
 
-    const rows = asArray(parseJsonLoose(structured.text)).map((o) => normalizeRow(o, columns));
-    const joined = research.sources.length ? research.sources.join(" | ") : "N/A";
-    for (const r of rows) r.Citations = joined; // batch-level real source URLs
+    const parsed = asArray(parseJsonLoose(structured.text));
+    const items = parsed.map((o) => {
+      const row = normalizeRow(o, columns);
+      row.Citations = rawCitations(o); // model's claimed URLs; gated below
+      return { row, ungrounded: rawUngrounded(o) };
+    });
+    // Grounding gate: keep only URLs the search actually returned; drop ungrounded rows.
+    const { kept, dropped } = applyGrounding(items, research.sources, columns);
     events.push({
       stage: "research", tool: "gemini", label: `Google-Search grounding · ${model}`,
       query: brief.slice(0, 120), resultCount: research.sources.length,
       urls: research.sources.slice(0, 5), ok: research.sources.length > 0,
+      detail: dropped.length ? `${dropped.length} row(s) rejected — no grounded source` : undefined,
     });
-    return { rows, events };
+    return { rows: kept, events };
   }
 
   // Lean single-call path (no Citations wanted, or non-Gemini provider).
@@ -310,7 +385,7 @@ export async function reviewBuildings(
     "(large building / facility on a central chilled-water system), and that its key facts are plausible.";
   const compact = rows.map((r, i) => ({
     index: i,
-    Building: r["Building"] ?? r[columns[0]] ?? "",
+    Building: nameOf(r, columns),
     Address: r["Address"] ?? "",
   }));
   const user = [
@@ -371,11 +446,10 @@ export type DedupResult = {
 };
 
 // How "complete" a row is = how many cells carry a real value (not N/A / empty).
-// Used to pick the best row in a duplicate group as the one to keep.
+// Used to pick the best row in a duplicate group as the one to keep. Citations is an
+// array (evidence, not a fact cell) so it's excluded from the count.
 const completeness = (r: Row, columns: string[]) =>
-  columns.reduce((n, c) => n + (r[c] && r[c] !== "N/A" ? 1 : 0), 0);
-
-const nameOf = (r: Row, columns: string[]) => r["Building"] ?? r[columns[0]] ?? "—";
+  columns.reduce((n, c) => n + (c !== "Citations" && r[c] && r[c] !== "N/A" ? 1 : 0), 0);
 
 export async function dedupeBuildings(
   provider: ProviderId,
@@ -452,11 +526,15 @@ export function applyDedupGroups(rows: Row[], groups: number[][], columns: strin
     );
     const merged: Row = { ...canonical };
     for (const col of columns) {
+      if (col === "Citations") continue; // array — unioned below, not string-backfilled
       if (!merged[col] || merged[col] === "N/A") {
         const fill = members.find((m) => m[col] && m[col] !== "N/A");
         if (fill) merged[col] = fill[col];
       }
     }
+    // Citations is evidence — union every duplicate's URLs so no source is lost on merge.
+    if (columns.includes("Citations"))
+      merged.Citations = [...new Set(members.flatMap((m) => m.Citations ?? []))];
     if (group.length > 1) {
       merges.push({
         kept: nameOf(canonical, columns),

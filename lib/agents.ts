@@ -4,7 +4,7 @@ import {
   getPreviousState,
   MemorySaver,
 } from "@langchain/langgraph";
-import { researchBuildings, reviewBuildings, dedupeBuildings, type Row, type LlmRun } from "./llm";
+import { researchBuildings, reviewBuildings, dedupeBuildings, nameOf, type Row, type LlmRun } from "./llm";
 import { findPersonInCharge } from "./enrich";
 import {
   buildModelPool,
@@ -61,7 +61,7 @@ export type LoopInput = {
 };
 
 const buildingKey = (r: Row, columns: string[]) =>
-  (r["Building"] ?? r[columns[0]] ?? "").trim().toLowerCase();
+  nameOf(r, columns).replace("—", "").trim().toLowerCase();
 
 // @task — Agent #1: research a batch of fresh candidates.
 // (Legacy loop path — unwraps to just rows; tool events are only surfaced by the
@@ -290,7 +290,7 @@ export function computeAgentOverlap(p: {
       for (const a of p.keyToAgents.get(alias) ?? []) set.add(a);
     }
     return {
-      building: row["Building"] ?? row[p.columns[0]] ?? "—",
+      building: nameOf(row, p.columns),
       agents: [...set].sort((a, b) => a - b),
       status: p.statuses[i] ?? "verified",
     };
@@ -501,7 +501,7 @@ export async function runMultiAgentResearch(input: MultiAgentInput): Promise<Mul
       const { person: pic, events } = await findPersonInCharge(
         reviewProvider,
         reviewModel,
-        row["Building"] ?? row[input.columns[0]] ?? "",
+        nameOf(row, input.columns),
         row["Address"] ?? "",
         reviewRun
       );

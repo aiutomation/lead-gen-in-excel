@@ -2,7 +2,16 @@ import { generateText, type LanguageModel } from "ai";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { tavilySearch, hitsToContext, hasTavily, type ToolEvent } from "./search";
-import { asArray, parseJsonLoose, type Row } from "./llm";
+import {
+  asArray,
+  parseJsonLoose,
+  normalizeRow,
+  rawCitations,
+  rawUngrounded,
+  applyGrounding,
+  type Row,
+} from "./llm";
+import { FEW_SHOT_EXAMPLES } from "./columns";
 
 // ─────────────────────────────────────────────────────────────────────────
 // Vercel AI SDK model registry — the "different model per agent" layer.
@@ -306,16 +315,6 @@ export function pickModelForAgent(pool: ModelEntry[], i: number): ModelEntry {
   return pool[i % pool.length];
 }
 
-function normalizeRow(obj: Record<string, unknown> | undefined, columns: string[]): Row {
-  const rec = obj ?? {};
-  const row: Row = {};
-  for (const col of columns) {
-    const v = rec[col];
-    row[col] = v === undefined || v === null || v === "" ? "N/A" : String(v);
-  }
-  return row;
-}
-
 // Run ONE research agent on ONE model via the AI SDK, returning normalised rows.
 // Every model gets Tavily web context injected (uniform grounding), so "each
 // agent has web search" holds regardless of which model it runs.
@@ -368,6 +367,7 @@ export async function researchWithModel(
   // discard the agent and its proof-of-search. On any failure we keep the recorded
   // search event, note what happened, and yield 0 rows — the agent still counts as
   // "searched successfully", it just contributed nothing to the table.
+  const wantCitations = columns.includes("Citations");
   let rows: Row[] = [];
   try {
     const { text } = await generateText({
@@ -381,6 +381,9 @@ export async function researchWithModel(
         opts.diversify ? `Angle for THIS agent: ${opts.diversify}` : "",
         webContext,
         "",
+        "Match this format (values only — omit fields you don't know):",
+        JSON.stringify(FEW_SHOT_EXAMPLES[0]),
+        "",
         `Return up to ${count} buildings as a JSON object {"rows": [ ... ]}.`,
         // The literal word "JSON" above is kept: some OpenAI-compatible providers
         // still expect it, and it steers the model to emit pure JSON.
@@ -388,20 +391,36 @@ export async function researchWithModel(
         JSON.stringify(columns),
         'Use "N/A" when a fact is unknown. Prefer large buildings likely on a central chilled-water system.',
         'Do not invent precise figures; prefix uncertain numbers with "~".',
+        // Grounding: cite from the live web results above and flag anything not backed by them.
+        wantCitations
+          ? '- "Citations": array of the source URLs (from the live web results above) that support THIS building.'
+          : "",
+        wantCitations
+          ? '- "_ungrounded": array of any of the above columns whose value is NOT backed by those results ([] if all cited).'
+          : "",
         '- Output JSON ONLY in the form {"rows": [ ... ]}. No prose, no markdown fences.',
       ]
         .filter(Boolean)
         .join("\n"),
     });
-    rows = asArray(parseJsonLoose(text)).map((o) => normalizeRow(o as Record<string, unknown>, columns));
+    const parsed = asArray(parseJsonLoose(text));
+    if (wantCitations) {
+      // Grounding gate: keep only URLs Tavily actually returned; drop ungrounded rows.
+      const items = parsed.map((o) => {
+        const row = normalizeRow(o, columns);
+        row.Citations = rawCitations(o);
+        return { row, ungrounded: rawUngrounded(o) };
+      });
+      const { kept, dropped } = applyGrounding(items, sources, columns);
+      rows = kept;
+      const last = events[events.length - 1];
+      if (last && dropped.length) last.detail = `${dropped.length} row(s) rejected — no grounded source`;
+    } else {
+      rows = parsed.map((o) => normalizeRow(o, columns));
+    }
   } catch (e) {
     const last = events[events.length - 1];
     if (last) last.detail = `search ok — model yielded no usable rows (${(e as Error)?.name ?? "error"})`;
-  }
-  // Batch-level citations from the Tavily sources this agent grounded on.
-  if (columns.includes("Citations") && sources.length) {
-    const joined = sources.join(" | ");
-    for (const r of rows) if (!r.Citations || r.Citations === "N/A") r.Citations = joined;
   }
   return { rows, events };
 }
