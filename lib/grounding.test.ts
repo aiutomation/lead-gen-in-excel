@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyGrounding, applyDedupGroups, type Row } from "./llm";
+import { applyGrounding, applyDedupGroups, extractUrls, type Row } from "./llm";
 
 // Build a Row with a string[] Citations. The Row type is an intersection, so Citations
 // must be set by assignment (not an inline literal) — same as normalizeRow does.
@@ -39,6 +39,23 @@ describe("applyGrounding", () => {
     expect(kept[0].Founded).toBe("1990"); // grounded fact survives
     expect(kept[0]["Area (ft2)"]).toBe("N/A"); // ungrounded field blanked
     expect(kept[0].Citations).toEqual(["https://real.example/1"]); // fake URL stripped
+  });
+});
+
+describe("extractUrls", () => {
+  it("pulls real page URLs from grounded prose and trims trailing punctuation", () => {
+    const prose =
+      "1 Utama is a mall (https://en.wikipedia.org/wiki/1_Utama). " +
+      "The Curve opened in 2004 — see https://thecurve.com.my/about, per the operator.";
+    expect(extractUrls(prose)).toEqual([
+      "https://en.wikipedia.org/wiki/1_Utama",
+      "https://thecurve.com.my/about",
+    ]);
+  });
+
+  it("dedupes repeats and returns [] for prose with no URLs", () => {
+    expect(extractUrls("no links here")).toEqual([]);
+    expect(extractUrls("a https://x.com b https://x.com")).toEqual(["https://x.com"]);
   });
 });
 

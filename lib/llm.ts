@@ -199,6 +199,15 @@ export function rawUngrounded(obj: unknown): string[] {
   return Array.isArray(rec._ungrounded) ? rec._ungrounded.map(String) : [];
 }
 
+// Extract bare http(s) URLs from grounded prose. Gemini's grounding metadata returns
+// opaque Google redirect URLs, but the model cites REAL page URLs inline in its prose —
+// those are the set the (non-grounded) structuring pass's citations must come from, so a
+// hallucinated URL added at structuring time is rejected. Trailing punctuation trimmed.
+export function extractUrls(text: string): string[] {
+  const m = text.match(/https?:\/\/[^\s)\]}"'<>]+/g) ?? [];
+  return [...new Set(m.map((u) => u.replace(/[.,;:!?]+$/, "")))];
+}
+
 // ---------------------------------------------------------------- GROUNDING GATE
 // The execution-phase rule: every extracted value must trace to a source URL that
 // the grounded search ACTUALLY returned, or it's rejected. Pure (no I/O) so it's
@@ -319,8 +328,11 @@ export async function researchBuildings(
       row.Citations = rawCitations(o); // model's claimed URLs; gated below
       return { row, ungrounded: rawUngrounded(o) };
     });
-    // Grounding gate: keep only URLs the search actually returned; drop ungrounded rows.
-    const { kept, dropped } = applyGrounding(items, research.sources, columns);
+    // Grounding gate: the valid set = URLs the grounded model cited in prose (real page
+    // URLs) UNION the grounding-metadata sources (opaque redirects). Structured citations
+    // must come from this set, else the row is rejected.
+    const validUrls = [...new Set([...extractUrls(research.text), ...research.sources])];
+    const { kept, dropped } = applyGrounding(items, validUrls, columns);
     events.push({
       stage: "research", tool: "gemini", label: `Google-Search grounding · ${model}`,
       query: brief.slice(0, 120), resultCount: research.sources.length,
