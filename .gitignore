@@ -40,6 +40,9 @@ yarn-error.log*
 .playwright-mcp/
 *.jpeg
 
+# data spreadsheets (source listings / exports — kept out of the repo)
+*.xlsx
+
 # vercel
 .vercel
 
