@@ -1,0 +1,18 @@
+# Render's GitHub webhook is stale, so pushes don't auto-deploy. This fires the
+# service's Deploy Hook on every push to master instead. Add the hook URL as a
+# repo secret named RENDER_DEPLOY_HOOK (Settings -> Secrets -> Actions).
+# Remove this workflow once the native GitHub App connection is reconnected.
+name: Deploy to Render
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy
+        run: curl -fsS -X POST "$RENDER_DEPLOY_HOOK"
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
